@@ -116,6 +116,14 @@ from ansible.module_utils.urls import open_url
 from ansible.module_utils._text import to_native
 from ansible_collections.community.vmware.plugins.module_utils.vmware import vmware_argument_spec
 
+#from pyVim.task import WaitForTask
+
+from ansible_collections.community.vmware.plugins.module_utils.vmware import (
+    PyVmomi,
+    find_datacenter_by_name,
+    vmware_argument_spec,
+    wait_for_task)
+
 
 def vmware_path(datastore, datacenter, path):
     ''' Constructs a URL path that VSphere accepts reliably '''
@@ -129,6 +137,22 @@ def vmware_path(datastore, datacenter, path):
     if datacenter:
         params['dcPath'] = datacenter
     return '{0}?{1}'.format(path, urlencode(params))
+
+def vmware_path2(datastore, path):
+    return '[{datastore}] {path}'.format(datastore=datastore,path=quote(path.strip('/')))
+
+class VMwareDatastore(PyVmomi):
+    def __init__(self, module):
+        super(VMwareDatastore, self).__init__(module)
+        self.datacenter_name = module.params['datacenter']
+        self.datastore_name = module.params['datastore']
+        self.datacenter = find_datacenter_by_name(self.content, self.datacenter_name)
+
+    def delete_file(self, path):
+        wait_for_task(self.content.fileManager.DeleteFile(vmware_path2(self.datastore_name, path), self.datacenter))
+
+    def create_directory(self, path):
+        wait_for_task(self.content.fileManager.MakeDirectory(vmware_path2(self.datastore_name, path), self.datacenter, True))
 
 
 def main():
@@ -169,6 +193,8 @@ def main():
         url=url,
     )
 
+    vmware_datastore = VMwareDatastore(module)
+
     # Check if the file/directory exists
     try:
         r = open_url(url, method='HEAD', timeout=timeout,
@@ -199,88 +225,23 @@ def main():
         if not exists:
             module.exit_json(changed=False, **result)
 
-        if module.check_mode:
-            result['reason'] = 'No Content'
-            result['status'] = 204
-        else:
+        if not module.check_mode:
             try:
-                r = open_url(url, method='DELETE', timeout=timeout,
-                             url_username=username, url_password=password,
-                             validate_certs=validate_certs, force_basic_auth=True)
-            except HTTPError as e:
-                r = e
-            except socket.error as e:
-                module.fail_json(msg=to_native(e), errno=e[0], reason=to_native(e), **result)
+                vmware_datastore.delete_file(path)
             except Exception as e:
                 module.fail_json(msg=to_native(e), errno=e[0], reason=to_native(e), **result)
 
-            if PY2:
-                sys.exc_clear()  # Avoid false positive traceback in fail_json() on Python 2
-
-            result['reason'] = r.msg
-            result['status'] = r.getcode()
-
-            if result['status'] == 405:
-                result['state'] = 'directory'
-                module.fail_json(msg='Directories cannot be removed with this module', errno=None, headers=dict(r.headers), **result)
-            elif result['status'] != 204:
-                module.fail_json(msg="Failed to remove '%s'" % path, errno=None, headers=dict(r.headers), **result)
-
-        result['size'] = None
         module.exit_json(changed=True, **result)
 
-    # NOTE: Creating a file in a non-existing directory, then remove the file
     elif state == 'directory':
         if exists:
             module.exit_json(changed=False, **result)
 
-        if module.check_mode:
-            result['reason'] = 'Created'
-            result['status'] = 201
-        else:
-            # Create a temporary file in the new directory
-            remote_path = vmware_path(datastore, datacenter, path + '/foobar.tmp')
-            temp_url = 'https://%s%s' % (host, remote_path)
-
+        if not module.check_mode:
             try:
-                r = open_url(temp_url, method='PUT', timeout=timeout,
-                             url_username=username, url_password=password,
-                             validate_certs=validate_certs, force_basic_auth=True)
-            except HTTPError as e:
-                r = e
-            except socket.error as e:
-                module.fail_json(msg=to_native(e), errno=e[0], reason=to_native(e), **result)
+                vmware_datastore.create_directory(path)
             except Exception as e:
                 module.fail_json(msg=to_native(e), errno=e[0], reason=to_native(e), **result)
-
-            if PY2:
-                sys.exc_clear()  # Avoid false positive traceback in fail_json() on Python 2
-
-            result['reason'] = r.msg
-            result['status'] = r.getcode()
-            if result['status'] != 201:
-                result['url'] = temp_url
-                module.fail_json(msg='Failed to create temporary file', errno=None, headers=dict(r.headers), **result)
-
-            try:
-                r = open_url(temp_url, method='DELETE', timeout=timeout,
-                             url_username=username, url_password=password,
-                             validate_certs=validate_certs, force_basic_auth=True)
-            except HTTPError as e:
-                r = e
-            except socket.error as e:
-                module.fail_json(msg=to_native(e), errno=e[0], reason=to_native(e), **result)
-            except Exception as e:
-                module.fail_json(msg=to_native(e), errno=e[0], reason=to_native(e), **result)
-
-            if PY2:
-                sys.exc_clear()  # Avoid false positive traceback in fail_json() on Python 2
-
-            status = r.getcode()
-            if status != 204:
-                result['reason'] = r.msg
-                result['status'] = status
-                module.warn('Failed to remove temporary file ({reason})'.format(**result))
 
         module.exit_json(changed=True, **result)
 
